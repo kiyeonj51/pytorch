@@ -1,10 +1,11 @@
-#include <ATen/native/quantized/cpu/fbgemm_utils.h>
-#include <ATen/native/quantized/cpu/qnnpack_utils.h>
-#include <ATen/native/quantized/cpu/conv_packed_params.h>
-#include <torch/custom_class.h>
-
 #include <ATen/ATen.h>
 #include <ATen/native/TensorFactories.h>
+
+#include <ATen/native/quantized/cpu/conv_packed_params.h>
+#include <ATen/native/quantized/cpu/fbgemm_utils.h>
+#include <ATen/native/quantized/cpu/packed_params.h>
+#include <ATen/native/quantized/cpu/serialization_versions.h>
+#include <ATen/native/quantized/cpu/qnnpack_utils.h>
 #include <ATen/quantized/QTensorImpl.h>
 #include <ATen/quantized/Quantizer.h>
 
@@ -213,99 +214,135 @@ Tensor ConvertToChannelsLast3dTensor(const Tensor& src) {
 
 template <int kSpatialDim = 2>
 CAFFE2_API torch::class_<ConvPackedParamsBase<kSpatialDim>> register_conv_params() {
-  using SerializationType = std::tuple<
-    at::Tensor,
-    c10::optional<at::Tensor>,
-    // these are meant to be torch::List<int64_t> but
-    // it's not supported by onnx, so we'll use Tensor as
-    // a workaround
-    torch::List<at::Tensor>,
-    torch::List<at::Tensor>,
-    torch::List<at::Tensor>,
-    at::Tensor>;
   static auto register_conv_params =
     torch::class_<ConvPackedParamsBase<kSpatialDim>>(
         "quantized", "Conv" + c10::to_string(kSpatialDim) + "dPackedParamsBase")
-    .def_pickle(
+    // TODO(before land): document the hack and add a deprecation date
+    .def_pickle_setstate_boxed_DO_NOT_USE(
         [](const c10::intrusive_ptr<ConvPackedParamsBase<kSpatialDim>>& params)
         -> SerializationType { // __getstate__
-          at::Tensor weight;
-          c10::optional<at::Tensor> bias;
-          std::tie(weight, bias) = params->unpack();
-          torch::List<at::Tensor> stride;
-          torch::List<at::Tensor> padding;
-          torch::List<at::Tensor> dilation;
-          at::Tensor groups;
-          for (int64_t s : params->stride()) {
-            stride.emplace_back(at::tensor(s));
-          }
-          for (int64_t p : params->padding()) {
-            padding.emplace_back(at::tensor(p));
-          }
-          for (int64_t d : params->dilation()) {
-            dilation.emplace_back(at::tensor(d));
-          }
-          groups = at::tensor(params->groups());
-          return std::make_tuple(
-              std::move(weight),
-              std::move(bias),
-              stride,
-              padding,
-              dilation,
-              groups);
+          return serialize_conv<kSpatialDim>(params);
         },
-        [](SerializationType state)
+        // TODO(before land): document everything well
+        [](c10::IValue v)
         -> c10::intrusive_ptr<ConvPackedParamsBase<kSpatialDim>> { // __setstate__
-          at::Tensor weight;
-          c10::optional<at::Tensor> bias;
-          torch::List<at::Tensor> stride_tensor, padding_tensor,
-            dilation_tensor;
-          at::Tensor groups_tensor;
-          torch::List<int64_t> stride, padding, dilation;
-          int64_t groups;
-          std::tie(weight, bias, stride_tensor, padding_tensor, dilation_tensor, groups_tensor) = state;
-          for (at::Tensor s : stride_tensor) {
-            stride.emplace_back(s[0].item<int64_t>());
-          }
-          for (at::Tensor p : padding_tensor) {
-            padding.emplace_back(p[0].item<int64_t>());
-          }
-          for (at::Tensor d : dilation_tensor) {
-            dilation.emplace_back(d[0].item<int64_t>());
-          }
-          groups = groups_tensor[0].item<int64_t>();
-          auto& ctx = at::globalContext();
 
-#ifdef USE_FBGEMM
-          if (ctx.qEngine() == at::QEngine::FBGEMM) {
-            return PackedConvWeight<kSpatialDim>::prepack(
-                weight,
-                bias,
-                stride,
-                padding,
-                dilation,
-                groups);
+          // determine the version based on IValue contents
+          int version = -1;
+          if (v.isTuple()) {
+            auto elements = v.toTuple()->elements();
+            if (elements.size() > 0) {
+              auto firstElement = elements[0];
+              // TODO before land: stronger checks
+              if (firstElement.isTensor()) {
+                version = 1;
+              } else if (firstElement.isString()) {
+                // TODO before land: parse version
+                version = 2;
+              }
+            }
           }
-#endif // USE_FBGEMM
-#ifdef USE_PYTORCH_QNNPACK
-          if (ctx.qEngine() == at::QEngine::QNNPACK) {
-            TORCH_CHECK(
-                kSpatialDim == 2,
-                "prepack/__setstate__: QNNPACK only supports Conv2d "
-                "now.");
-            return PackedConvWeightsQnnp<kSpatialDim>::prepack(
-                weight,
-                bias,
-                stride,
-                padding,
-                dilation,
-                groups);
+          TORCH_INTERNAL_ASSERT(version != -1, "Unable to parse serialization version");
+
+          SerializationType state;
+
+          if (version == 1) {
+            // version 1 - convert to version 2 manually
+
+            auto elements = v.toTuple()->elements();
+
+            at::Tensor weight = elements[0].toTensor();
+            // TODO before land: test optional bias
+            c10::optional<at::Tensor> bias = elements[1].toTensor();
+            torch::List<at::Tensor> stride_x_kSpatialDim = elements[2].toTensorList();
+            torch::List<at::Tensor> padding_x_kSpatialDim = elements[3].toTensorList();
+            torch::List<at::Tensor> dilation_x_kSpatialDim = elements[4].toTensorList();
+            at::Tensor groups = elements[5].toTensor();
+
+            std::string version = "2";
+            std::vector<at::Tensor> non_optional;
+            std::vector<c10::optional<at::Tensor>> optional;
+
+            std::vector<int64_t> params_vec;
+            params_vec.push_back(kSpatialDim);
+            for (int i = 0; i < stride_x_kSpatialDim.size(); i++) {
+              auto stride = stride_x_kSpatialDim.get(0);
+              params_vec.push_back(stride[0].item<int64_t>());
+            }
+            for (int i = 0; i < padding_x_kSpatialDim.size(); i++) {
+              auto padding = padding_x_kSpatialDim.get(0);
+              params_vec.push_back(padding[0].item<int64_t>());
+            }
+            for (int i = 0; i < dilation_x_kSpatialDim.size(); i++) {
+              auto dilation = dilation_x_kSpatialDim.get(0);
+              params_vec.push_back(dilation[0].item<int64_t>());
+            }
+            params_vec.push_back(groups[0].item<int64_t>());
+            at::Tensor params_tensor = at::from_blob(
+                params_vec.data(), {params_vec.size()},
+                at::TensorOptions().dtype(at::kLong));
+
+            // non_optional.emplace_back(std::move(params_tensor));
+            // TODO before land: fix clone
+            non_optional.emplace_back(params_tensor.clone());
+            non_optional.emplace_back(std::move(weight));
+            optional.emplace_back(std::move(bias));
+
+            state = std::tie(version, non_optional, optional);
+
+            // create a v2 object with data from v1
+            // TODO before land: clean up everything (this is just the first version which worked)
+            /*
+            std::string name_v2 = "conv";
+            // int64_t version_v2 = 2;
+            std::vector<int64_t> version_v2 = {2};
+            std::vector<at::Tensor> required_tensors_v2;
+            required_tensors_v2.push_back(weight);
+            std::vector<c10::optional<at::Tensor>> optional_tensors_v2;
+            optional_tensors_v2.push_back(bias);
+            std::vector<double> doubles_v2;
+            std::vector<int64_t> ints_v2;
+            int64_t spatialDim = stride_x_kSpatialDim.size();
+            ints_v2.push_back(spatialDim);
+            for (int i = 0; i < stride_x_kSpatialDim.size(); i++) {
+              auto stride = stride_x_kSpatialDim.get(0);
+              ints_v2.push_back(stride[0].item<int64_t>());
+            }
+            for (int i = 0; i < padding_x_kSpatialDim.size(); i++) {
+              auto padding = padding_x_kSpatialDim.get(0);
+              ints_v2.push_back(padding[0].item<int64_t>());
+            }
+            for (int i = 0; i < dilation_x_kSpatialDim.size(); i++) {
+              auto dilation = dilation_x_kSpatialDim.get(0);
+              ints_v2.push_back(dilation[0].item<int64_t>());
+            }
+
+            // TODO before land: check numerical equivalency with tests
+            state = std::make_tuple(name_v2, version_v2, required_tensors_v2, optional_tensors_v2,
+                doubles_v2, ints_v2);
+                */
+
+          } else {
+            // version 2
+            // TODO before land: assertions
+
+            auto elements = v.toTuple()->elements();
+            std::string version = elements[0].toStringRef();
+            torch::List<at::Tensor> non_optional = elements[1].toTensorList();
+            // TODO: OptionalTensorList
+            torch::List<c10::IValue> optional = elements[2].toList();
+            std::vector<at::Tensor> non_optional_vec;
+            non_optional_vec.insert(non_optional_vec.end(), non_optional.begin(), non_optional.end());
+
+            std::vector<c10::optional<at::Tensor>> optional_vec;
+            c10::optional<at::Tensor> bias = optional.get(0).toOptional<at::Tensor>();
+            optional_vec.push_back(bias);
+
+            state = std::tie(version, non_optional_vec, optional_vec);
+
           }
-#endif // USE_PYTORCH_QNNPACK
-          TORCH_CHECK(
-              false,
-              "Didn't find engine for when deserializing ConvPackedParams: ",
-              toString(ctx.qEngine()));
+
+          return deserialize_conv<kSpatialDim>(state);
         })
     .def("weight", [](const c10::intrusive_ptr<ConvPackedParamsBase<kSpatialDim>>& self) {
                      at::Tensor weight;
